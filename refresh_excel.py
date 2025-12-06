@@ -896,6 +896,14 @@ def refresh_excel_file(
     request: Request,
     source: str = "manual",   # 'manual' by default; override when called internally
 ):
+    # Try to grab the process-wide Excel gate without blocking.
+    # If another refresh is in progress, immediately report "busy" so the router
+    # can try another Windows worker.
+    acquired_gate = _gate.acquire(blocking=False)
+    if not acquired_gate:
+        log("[gate] busy: another refresh in progress; returning 503")
+        raise HTTPException(status_code=503, detail="busy")
+
     pythoncom.CoInitialize()
     wb = None
     app_excel = None
@@ -910,255 +918,254 @@ def refresh_excel_file(
         s3_lastmod_after  = None
         s3_etag_after     = None
 
-        with _gate:
-            key = data.path.strip()
-            log(f"\n==== /api/refresh {key} ====")
-            if not key.lower().endswith((".xlsx", ".xlsm")):
-                raise HTTPException(400, "Only .xlsx/.xlsm")
+        key = data.path.strip()
+        log(f"\n==== /api/refresh {key} ====")
+        if not key.lower().endswith((".xlsx", ".xlsm")):
+            raise HTTPException(400, "Only .xlsx/.xlsm")
 
-            # Proactive cleanup so we never inherit zombies
-            kill_excel()
-            time.sleep(0.25)
+        # Proactive cleanup so we never inherit zombies
+        kill_excel()
+        time.sleep(0.25)
 
-            base  = os.path.basename(key)
-            safe  = re.sub(r"[^A-Za-z0-9._-]", "_", base)
-            local = os.path.join(WORK_DIR, safe)
+        base  = os.path.basename(key)
+        safe  = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+        local = os.path.join(WORK_DIR, safe)
 
-            t0_all = _now()
+        t0_all = _now()
 
-            # 0) S3 → local
-            t0_dl = _now()
-            log(f"[phase] s3_download_start {key} -> {local}")
+        # 0) S3 → local
+        t0_dl = _now()
+        log(f"[phase] s3_download_start {key} -> {local}")
 
-            # NEW: snapshot S3 state before we download
+        # NEW: snapshot S3 state before we download
+        try:
+            head_before = S3.head_object(Bucket=BUCKET, Key=key)
+            s3_lastmod_before = head_before.get("LastModified")
+            s3_etag_before    = head_before.get("ETag")
+            log(f"[s3] before LastModified={s3_lastmod_before} ETag={s3_etag_before}")
+        except Exception as e:
+            log(f"[s3] head_before FAILED: {e}")
+
+        s3_download_atomic(BUCKET, key, local)
+        unblock_file(local)
+        log("[phase] s3_download_ok")
+        t1_dl = _now()
+
+        # 1) Launch Excel (fresh)
+        t0_open = _now()
+        app_excel = xw.App(visible=True, add_book=False)
+        log("[phase] excel_started")
+        app_excel.display_alerts = False
+        app_excel.screen_updating = True
+        try:
+            app_excel.api.CalculateBeforeSave = True
+        except Exception:
+            pass
+        pid = getattr(app_excel, "pid", None)
+        log(f"[phase] excel_pid={pid}")
+
+        wb = open_workbook_robust(app_excel, local)
+        log(f"[excel] opened: {wb.name}")
+        try:
+            send_keys("{ESC}")
+        except Exception:
+            pass
+
+        app_api = app_excel.api
+        try:
+            wb.activate()
+            aw = app_api.ActiveWindow
             try:
-                head_before = S3.head_object(Bucket=BUCKET, Key=key)
-                s3_lastmod_before = head_before.get("LastModified")
-                s3_etag_before    = head_before.get("ETag")
-                log(f"[s3] before LastModified={s3_lastmod_before} ETag={s3_etag_before}")
-            except Exception as e:
-                log(f"[s3] head_before FAILED: {e}")
-
-            s3_download_atomic(BUCKET, key, local)
-            unblock_file(local)
-            log("[phase] s3_download_ok")
-            t1_dl = _now()
-
-            # 1) Launch Excel (fresh)
-            t0_open = _now()
-            app_excel = xw.App(visible=True, add_book=False)
-            log("[phase] excel_started")
-            app_excel.display_alerts = False
-            app_excel.screen_updating = True
-            try:
-                app_excel.api.CalculateBeforeSave = True
+                aw.Visible = True
+                aw.WindowState = -4137  # xlMaximized
             except Exception:
                 pass
-            pid = getattr(app_excel, "pid", None)
-            log(f"[phase] excel_pid={pid}")
+            log(f"[focus] active workbook={app_api.ActiveWorkbook.Name}")
+        except Exception as e:
+            log(f"[focus] activation failed: {e}")
+        t1_open = _now()
 
-            wb = open_workbook_robust(app_excel, local)
-            log(f"[excel] opened: {wb.name}")
+        # 2) Ticker naming from filename
+        name_wo_ext = os.path.splitext(base)[0]
+        parts = name_wo_ext.split("_")
+        base_ticker = parts[0].upper() if parts else ""
+        if not base_ticker:
+            raise HTTPException(400, "Cannot infer ticker from filename")
+        vatkr = base_ticker if re.search(r'_[A-Z]{2}$', base_ticker) else f"{base_ticker}_US"
+
+        # ---- log run start (best-effort) ----
+        run_id = log_excel_refresh_run_start(vatkr, key, source)
+
+        # 3) Discover params (Model sheet) and detect VA-ness from workbook (no allow-list)
+        t0_discover = _now()
+        hdr_row, periods, codes_rows = discover_model_params(wb, sheet_name="Model")
+        codes_all = [c for _, c in codes_rows]
+        codes = [c for c in codes_all if re.fullmatch(r'\s*N_\d+\s*', str(c) or "", flags=re.I)]
+        rows_node = [(r, c) for (r, c) in codes_rows if re.fullmatch(r'\s*N_\d+\s*', str(c) or "", flags=re.I)]
+
+        # Autodetect VA: must have period labels AND at least one NodeCode in col B
+        has_va = bool(periods) and len(codes) > 0
+
+        log(f"[model] header_row={hdr_row} codes={len(codes)} periods={len(periods)} has_va={has_va}")
+        # Only raise if periods missing; codes may be empty for some non-VA models
+        if not periods:
+            raise HTTPException(422, "No period labels discovered from Model (row 4).")
+        t1_discover = _now()
+
+        # Convert 'FQ+N' → '+NFQ' for backend compatibility (leave FY-YYYY / 1QFY-YYYY / NTM/LTM/STM unchanged)
+        def _to_backend_period(p: str) -> str:
+            s = str(p).strip().upper()
+            m = re.fullmatch(r'FQ([+\-]?\d+)', s)
+            if m:
+                n = m.group(1)
+                if not n.startswith(('+', '-')) and n:
+                    n = f'+{n}'
+                return f"{n}FQ"
+            m = re.fullmatch(r'F([+\-]?\d+)', s)
+            if m:
+                n = m.group(1)
+                if not n.startswith(('+', '-')) and n:
+                    n = f'+{n}'
+                return f"{n}F"
+            return s
+
+        periods_backend = [_to_backend_period(p) for p in periods]
+
+        # 4) Backend rebuild (ALWAYS when workbook looks like a VA model AND codes present)
+        t0_rebuild = _now()
+        if has_va and codes:
+            va_used = True
             try:
-                send_keys("{ESC}")
-            except Exception:
-                pass
-
-            app_api = app_excel.api
-            try:
-                wb.activate()
-                aw = app_api.ActiveWindow
-                try:
-                    aw.Visible = True
-                    aw.WindowState = -4137  # xlMaximized
-                except Exception:
-                    pass
-                log(f"[focus] active workbook={app_api.ActiveWorkbook.Name}")
-            except Exception as e:
-                log(f"[focus] activation failed: {e}")
-            t1_open = _now()
-
-            # 2) Ticker naming from filename
-            name_wo_ext = os.path.splitext(base)[0]
-            parts = name_wo_ext.split("_")
-            base_ticker = parts[0].upper() if parts else ""
-            if not base_ticker:
-                raise HTTPException(400, "Cannot infer ticker from filename")
-            vatkr = base_ticker if re.search(r'_[A-Z]{2}$', base_ticker) else f"{base_ticker}_US"
-
-            # ---- log run start (best-effort) ----
-            run_id = log_excel_refresh_run_start(vatkr, key, source)
-
-            # 3) Discover params (Model sheet) and detect VA-ness from workbook (no allow-list)
-            t0_discover = _now()
-            hdr_row, periods, codes_rows = discover_model_params(wb, sheet_name="Model")
-            codes_all = [c for _, c in codes_rows]
-            codes = [c for c in codes_all if re.fullmatch(r'\s*N_\d+\s*', str(c) or "", flags=re.I)]
-            rows_node = [(r, c) for (r, c) in codes_rows if re.fullmatch(r'\s*N_\d+\s*', str(c) or "", flags=re.I)]
-
-            # Autodetect VA: must have period labels AND at least one NodeCode in col B
-            has_va = bool(periods) and len(codes) > 0
-
-            log(f"[model] header_row={hdr_row} codes={len(codes)} periods={len(periods)} has_va={has_va}")
-            # Only raise if periods missing; codes may be empty for some non-VA models
-            if not periods:
-                raise HTTPException(422, "No period labels discovered from Model (row 4).")
-            t1_discover = _now()
-
-            # Convert 'FQ+N' → '+NFQ' for backend compatibility (leave FY-YYYY / 1QFY-YYYY / NTM/LTM/STM unchanged)
-            def _to_backend_period(p: str) -> str:
-                s = str(p).strip().upper()
-                m = re.fullmatch(r'FQ([+\-]?\d+)', s)
-                if m:
-                    n = m.group(1)
-                    if not n.startswith(('+', '-')) and n:
-                        n = f'+{n}'
-                    return f"{n}FQ"
-                m = re.fullmatch(r'F([+\-]?\d+)', s)
-                if m:
-                    n = m.group(1)
-                    if not n.startswith(('+', '-')) and n:
-                        n = f'+{n}'
-                    return f"{n}F"
-                return s
-
-            periods_backend = [_to_backend_period(p) for p in periods]
-
-            # 4) Backend rebuild (ALWAYS when workbook looks like a VA model AND codes present)
-            t0_rebuild = _now()
-            if has_va and codes:
-                va_used = True
-                try:
-                    if VA_AS_OF:
-                        log(f"[backend] REBUILD ticker={vatkr} codes={len(codes)} periods={len(periods)} as_of={VA_AS_OF}")
-                        resp = backend_rebuild_va_pg_with_asof(
-                            vatkr, codes, periods_backend, BACKEND_BASE, as_of=VA_AS_OF, require=VA_REBUILD_REQUIRE
-                        )
-                    else:
-                        log(f"[backend] REBUILD ticker={vatkr} codes={len(codes)} periods={len(periods)} live")
-                        resp = backend_rebuild_va_pg(
-                            vatkr, codes, periods_backend, BACKEND_BASE, require=VA_REBUILD_REQUIRE
-                        )
-                    va_rebuild_status = resp.get("status", "ok")
-                    log(f"[backend] va_refresh/rebuild {va_rebuild_status}")
-                except Exception as e:
-                    va_rebuild_status = f"error:{type(e).__name__}"
-                    log(f"[backend] ERROR rebuild failed: {e}")
-                    if VA_REBUILD_REQUIRE:
-                        raise
-            else:
-                log("[backend] skip va_refresh/rebuild (non-VA workbook or no codes)")
-            t1_rebuild = _now()
-
-            # 5) Query evidence sheet(s)
-            t0_query = _now()
-            try:
-                includes = ["query_llm_outputs_work"]
-                if va_used:
-                    ensure_query_va_refresh(wb, vatkr)
-                    includes.insert(0, "query_va_refresh")
-                run_query_tabs(
-                    wb, fork="", ticker=vatkr, db=DB_URL,
-                    include=includes, parallel=True, max_workers=5, stmt_timeout_ms=15000
-                )
-            except Exception as e:
-                log(f"[sql] ERROR query_tabs: {e}")
-            t1_query = _now()
-
-            # 6) One-time conversion (only for VA flows)
-            try:
-                if va_used:
-                    replaced = ensure_model_formulas(wb, "Model", hdr_row, periods, rows_node)
-                    if replaced:
-                        log(f"[convert] converted {replaced} VA cells to SUMIFS")
+                if VA_AS_OF:
+                    log(f"[backend] REBUILD ticker={vatkr} codes={len(codes)} periods={len(periods)} as_of={VA_AS_OF}")
+                    resp = backend_rebuild_va_pg_with_asof(
+                        vatkr, codes, periods_backend, BACKEND_BASE, as_of=VA_AS_OF, require=VA_REBUILD_REQUIRE
+                    )
                 else:
-                    log("[convert] skip ensure_model_formulas (non-VA workbook)")
+                    log(f"[backend] REBUILD ticker={vatkr} codes={len(codes)} periods={len(periods)} live")
+                    resp = backend_rebuild_va_pg(
+                        vatkr, codes, periods_backend, BACKEND_BASE, require=VA_REBUILD_REQUIRE
+                    )
+                va_rebuild_status = resp.get("status", "ok")
+                log(f"[backend] va_refresh/rebuild {va_rebuild_status}")
             except Exception as e:
-                log(f"[convert] ERROR: {e}")
+                va_rebuild_status = f"error:{type(e).__name__}"
+                log(f"[backend] ERROR rebuild failed: {e}")
+                if VA_REBUILD_REQUIRE:
+                    raise
+        else:
+            log("[backend] skip va_refresh/rebuild (non-VA workbook or no codes)")
+        t1_rebuild = _now()
 
-            # 7) Recalc, save, upload
-            t0_recalc = _now()
-            try:
-                app_api.Calculate()
-            except Exception:
-                pass
-            t1_recalc = _now()
-
-            t0_save = _now()
-            wb.save()
-            wb.close()
-            log("[phase] workbook_closed")
-            t1_save = _now()
-
-            t0_up = _now()
-            log(f"[phase] s3_upload_start {local} -> {key}")
-            S3.upload_file(local, BUCKET, key)
-            log("[phase] s3_upload_ok")
-            t1_up = _now()
-
-            # : snapshot S3 state after upload
-            try:
-                head_after = S3.head_object(Bucket=BUCKET, Key=key)
-                s3_lastmod_after = head_after.get("LastModified")
-                s3_etag_after    = head_after.get("ETag")
-                log(f"[s3] after LastModified={s3_lastmod_after} ETag={s3_etag_after}")
-            except Exception as e:
-                log(f"[s3] head_after FAILED: {e}")
-
-            # 8) Durations + response
-            total = _fmt(_now() - t0_all)
-            durations = {
-                "download_s":   _fmt(t1_dl - t0_dl),
-                "open_s":       _fmt(t1_open - t0_open),
-                "discover_s":   _fmt(t1_discover - t0_discover),
-                "rebuild_s":    _fmt(t1_rebuild - t0_rebuild),
-                "query_s":      _fmt(t1_query - t0_query),
-                "recalc_s":     _fmt(t1_recalc - t0_recalc),
-                "save_close_s": _fmt(t1_save - t0_save),
-                "upload_s":     _fmt(t1_up - t0_up),
-                "total_s":      total,
-                # NEW: S3 metadata snapshots for post-mortems
-                "s3_lastmod_before": (
-                    s3_lastmod_before.isoformat() if s3_lastmod_before else None
-                ),
-                "s3_etag_before":    s3_etag_before,
-                "s3_lastmod_after": (
-                    s3_lastmod_after.isoformat() if s3_lastmod_after else None
-                ),
-                "s3_etag_after":     s3_etag_after,
-                "s3_changed_during_run": (
-                    True
-                    if (s3_etag_before is not None
-                        and s3_etag_after is not None
-                        and s3_etag_before != s3_etag_after)
-                    else False
-                ),
-            }
-
-            resp = {
-                "status":    "ok",
-                "file":      key,
-                "ticker":    vatkr,
-                "va_used":   bool(va_used),
-                "va_rebuild": va_rebuild_status,  # "ok" | "skipped" | "error:..."
-                "codes":     len(codes),
-                "periods":   len(periods),
-                "durations": durations,
-            }
-
-            # ---- log run finish (success) ----
-            log_excel_refresh_run_finish(
-                run_id,
-                status="ok",
-                va_used=bool(va_used),
-                va_rebuild=str(va_rebuild_status),
-                codes=len(codes),
-                periods=len(periods),
-                durations=durations,
-                error_message=None,
+        # 5) Query evidence sheet(s)
+        t0_query = _now()
+        try:
+            includes = ["query_llm_outputs_work"]
+            if va_used:
+                ensure_query_va_refresh(wb, vatkr)
+                includes.insert(0, "query_va_refresh")
+            run_query_tabs(
+                wb, fork="", ticker=vatkr, db=DB_URL,
+                include=includes, parallel=True, max_workers=5, stmt_timeout_ms=15000
             )
-            log(f"[summary] {json.dumps(resp, ensure_ascii=False)}")
-            return JSONResponse(resp, status_code=200)
+        except Exception as e:
+            log(f"[sql] ERROR query_tabs: {e}")
+        t1_query = _now()
+
+        # 6) One-time conversion (only for VA flows)
+        try:
+            if va_used:
+                replaced = ensure_model_formulas(wb, "Model", hdr_row, periods, rows_node)
+                if replaced:
+                    log(f"[convert] converted {replaced} VA cells to SUMIFS")
+            else:
+                log("[convert] skip ensure_model_formulas (non-VA workbook)")
+        except Exception as e:
+            log(f"[convert] ERROR: {e}")
+
+        # 7) Recalc, save, upload
+        t0_recalc = _now()
+        try:
+            app_api.Calculate()
+        except Exception:
+            pass
+        t1_recalc = _now()
+
+        t0_save = _now()
+        wb.save()
+        wb.close()
+        log("[phase] workbook_closed")
+        t1_save = _now()
+
+        t0_up = _now()
+        log(f"[phase] s3_upload_start {local} -> {key}")
+        S3.upload_file(local, BUCKET, key)
+        log("[phase] s3_upload_ok")
+        t1_up = _now()
+
+        # : snapshot S3 state after upload
+        try:
+            head_after = S3.head_object(Bucket=BUCKET, Key=key)
+            s3_lastmod_after = head_after.get("LastModified")
+            s3_etag_after    = head_after.get("ETag")
+            log(f"[s3] after LastModified={s3_lastmod_after} ETag={s3_etag_after}")
+        except Exception as e:
+            log(f"[s3] head_after FAILED: {e}")
+
+        # 8) Durations + response
+        total = _fmt(_now() - t0_all)
+        durations = {
+            "download_s":   _fmt(t1_dl - t0_dl),
+            "open_s":       _fmt(t1_open - t0_open),
+            "discover_s":   _fmt(t1_discover - t0_discover),
+            "rebuild_s":    _fmt(t1_rebuild - t0_rebuild),
+            "query_s":      _fmt(t1_query - t0_query),
+            "recalc_s":     _fmt(t1_recalc - t0_recalc),
+            "save_close_s": _fmt(t1_save - t0_save),
+            "upload_s":     _fmt(t1_up - t0_up),
+            "total_s":      total,
+            # NEW: S3 metadata snapshots for post-mortems
+            "s3_lastmod_before": (
+                s3_lastmod_before.isoformat() if s3_lastmod_before else None
+            ),
+            "s3_etag_before":    s3_etag_before,
+            "s3_lastmod_after": (
+                s3_lastmod_after.isoformat() if s3_lastmod_after else None
+            ),
+            "s3_etag_after":     s3_etag_after,
+            "s3_changed_during_run": (
+                True
+                if (s3_etag_before is not None
+                    and s3_etag_after is not None
+                    and s3_etag_before != s3_etag_after)
+                else False
+            ),
+        }
+
+        resp = {
+            "status":    "ok",
+            "file":      key,
+            "ticker":    vatkr,
+            "va_used":   bool(va_used),
+            "va_rebuild": va_rebuild_status,  # "ok" | "skipped" | "error:..."
+            "codes":     len(codes),
+            "periods":   len(periods),
+            "durations": durations,
+        }
+
+        # ---- log run finish (success) ----
+        log_excel_refresh_run_finish(
+            run_id,
+            status="ok",
+            va_used=bool(va_used),
+            va_rebuild=str(va_rebuild_status),
+            codes=len(codes),
+            periods=len(periods),
+            durations=durations,
+            error_message=None,
+        )
+        log(f"[summary] {json.dumps(resp, ensure_ascii=False)}")
+        return JSONResponse(resp, status_code=200)
 
     except HTTPException as e:
         # log as error, then re-raise
@@ -1198,6 +1205,14 @@ def refresh_excel_file(
             pass
         kill_excel()
         pythoncom.CoUninitialize()
+
+        # release the global gate so the next request can proceed
+        if acquired_gate:
+            try:
+                _gate.release()
+            except RuntimeError:
+                # in case of double-release or lock already unlocked, don't crash
+                pass
 
 # ---------- convenience: refresh by ticker (latest file on S3) ----------
 class TickerRequest(BaseModel):
@@ -1256,3 +1271,18 @@ def refresh_by_ticker(data: TickerRequest, request: Request):
     key = _find_latest_model_key(BUCKET, data.ticker)
     # This path is used by nightly ingest job → mark as nightly
     return refresh_excel_file(RefreshRequest(path=key), request, source="nightly_finmodels")
+
+@app.get("/health")
+def health():
+    """
+    Simple health endpoint for the Excel router.
+
+    - status: 'ok' if the service is up
+    - busy: True if a refresh is currently running (gate is held)
+    """
+    # threading.Lock has .locked() in Python; safe to call here
+    busy = _gate.locked()
+    return {
+        "status": "ok",
+        "busy": busy,
+    }
