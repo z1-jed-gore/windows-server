@@ -19,6 +19,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal  # NEW: for safe coercion of DB numerics
 
 # ---------- config ----------
 BUCKET = "agentic-data"
@@ -78,6 +79,20 @@ def kill_excel():
         log("[phase] excel_killed")
     except Exception:
         pass
+
+def _excel_safe_value(v):
+    """
+    Coerce DB-returned values into Excel-safe Python types.
+
+    - Decimal -> float (no quantization; preserve DB precision)
+    - Everything else returned as-is.
+    """
+    if isinstance(v, Decimal):
+        try:
+            return float(v)
+        except (ValueError, OverflowError):
+            return None
+    return v
 
 # ---------- external-data refresh (PowerQuery/Connections/QueryTables) ----------
 import re as _reva
@@ -755,8 +770,15 @@ def run_query_tabs(
                     cur.execute("SET lock_timeout = '2s'")
                     cur.execute("SET statement_timeout = %s", (f"{stmt_timeout_ms}ms",))
                 cur.execute(sql)
-                rows = cur.fetchall() if cur.description else []
+                raw_rows = cur.fetchall() if cur.description else []
                 cols = [d.name for d in cur.description] if cur.description else []
+
+            # Coerce all cell values to Excel-safe types (Decimal -> float, etc.)
+            rows = [
+                [_excel_safe_value(v) for v in row]
+                for row in raw_rows
+            ]
+
             ms = int((time.time() - t0) * 1000)
             return name, cols, rows, f"ok {ms}ms"
         except Exception as e:
@@ -1124,14 +1146,12 @@ def refresh_excel_file(
                 include=includes, parallel=True, max_workers=5, stmt_timeout_ms=15000
             )
 
-            #enforce 4dp display on the user-facing llm_outputs_work sheet as well
+            # enforce 4dp display on the user-facing llm_outputs_work sheet as well
             ensure_llm_outputs_work_format(wb)
 
         except Exception as e:
             log(f"[sql] ERROR query_tabs: {e}")
         t1_query = _now()
-
-        
 
         # 6) One-time conversion (only for VA flows)
         try:
