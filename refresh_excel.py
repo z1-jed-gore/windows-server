@@ -614,6 +614,61 @@ def log_excel_refresh_run_finish(
     except Exception as e:
         log(f"[db] excel_refresh_runs finish FAILED id={run_id}: {e}")
 
+def ensure_llm_outputs_work_format(wb):
+    """
+    Force the 'value' column on the llm_outputs_work sheet to 4 decimals
+    (0.0000), if the sheet and header exist.
+
+    This does NOT change any formulas; it only changes the displayed format.
+    """
+    try:
+        ws = wb.sheets["llm_outputs_work"]
+    except Exception:
+        log("[fmt] llm_outputs_work sheet not found; skipping 4dp formatting")
+        return
+
+    try:
+        # Assume headers are in row 3 and data starts at row 4, same as query_ sheets
+        header_row = 3
+        first_data_row = header_row + 1
+
+        # Get header row from column C onwards (where query_ sheets write)
+        hdr_rng = ws.range((header_row, 3), (header_row, 200)).value
+        if isinstance(hdr_rng, (list, tuple)) and hdr_rng and isinstance(hdr_rng[0], (list, tuple)):
+            row_vals = list(hdr_rng[0])
+        elif isinstance(hdr_rng, (list, tuple)):
+            row_vals = list(hdr_rng)
+        else:
+            row_vals = [hdr_rng]
+
+        # Find 'value' column in headers
+        value_idx = None
+        for i, col_name in enumerate(row_vals):
+            if str(col_name).strip().lower() == "value":
+                value_idx = i
+                break
+
+        if value_idx is None:
+            log("[fmt] llm_outputs_work: no 'value' header found; skipping 4dp formatting")
+            return
+
+        # Translate header index → column index (C is 3)
+        value_col_idx = 3 + value_idx
+
+        # Determine how many rows to format based on the used range
+        last_row = ws.used_range.last_cell.row
+        if last_row <= header_row:
+            log("[fmt] llm_outputs_work: no data rows under header; skipping 4dp formatting")
+            return
+
+        rng = ws.range((first_data_row, value_col_idx), (last_row, value_col_idx))
+        rng.number_format = "0.0000"
+        log(f"[fmt] llm_outputs_work: formatted Value column to 4 decimals "
+            f"(col={value_col_idx}, rows={first_data_row}-{last_row})")
+
+    except Exception as e:
+        log(f"[fmt] llm_outputs_work: 4dp formatting FAILED: {e}")
+
 
 def run_query_tabs(
     wb, fork: str, ticker: str, db=DB_URL,
@@ -1068,9 +1123,15 @@ def refresh_excel_file(
                 wb, fork="", ticker=vatkr, db=DB_URL,
                 include=includes, parallel=True, max_workers=5, stmt_timeout_ms=15000
             )
+
+            #enforce 4dp display on the user-facing llm_outputs_work sheet as well
+            ensure_llm_outputs_work_format(wb)
+
         except Exception as e:
             log(f"[sql] ERROR query_tabs: {e}")
         t1_query = _now()
+
+        
 
         # 6) One-time conversion (only for VA flows)
         try:
